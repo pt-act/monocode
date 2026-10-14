@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
+use crate::secret_store::{self, StorageMode};
+
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_LIMIT: u32 = 40;
+const KEYRING_SERVICE: &str = "MonoCode";
+const CONFIG_KEY: &str = "jira-config";
 const COMMENT_LIMIT: u32 = 50;
 const ISSUE_FIELDS: [&str; 6] = [
     "summary", "status", "updated", "labels", "assignee", "project",
@@ -20,6 +24,7 @@ pub struct JiraStatus {
     pub connected: bool,
     pub site: String,
     pub email: String,
+    pub storage: Option<StorageMode>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -112,7 +117,10 @@ pub struct JiraIssueThread {
 #[tauri::command(async)]
 pub fn jira_status(app: AppHandle) -> Result<JiraStatus, String> {
     let config = read_config(&app)?;
-    Ok(status_for(config.as_ref()))
+    Ok(status_for(
+        config.as_ref(),
+        secret_storage(&app, CONFIG_KEY)?,
+    ))
 }
 
 #[tauri::command]
@@ -126,7 +134,7 @@ pub async fn jira_set_config(
         let token = token.trim().to_string();
         if token.is_empty() {
             delete_config(&app)?;
-            return Ok(status_for(None));
+            return Ok(status_for(None, None));
         }
         let email = email.trim().to_string();
         if email.is_empty() || !email.contains('@') {
@@ -144,8 +152,8 @@ pub async fn jira_set_config(
         {
             return Err("Jira did not return the current user".into());
         }
-        write_config(&app, &config)?;
-        Ok(status_for(Some(&config)))
+        let storage = write_config(&app, &config)?;
+        Ok(status_for(Some(&config), Some(storage)))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -250,13 +258,14 @@ pub async fn jira_issue_comment(
     .map_err(|error| error.to_string())?
 }
 
-fn status_for(config: Option<&JiraConfig>) -> JiraStatus {
+fn status_for(config: Option<&JiraConfig>, storage: Option<StorageMode>) -> JiraStatus {
     JiraStatus {
         connected: config.is_some(),
         site: config.map(|config| config.site.clone()).unwrap_or_default(),
         email: config
             .map(|config| config.email.clone())
             .unwrap_or_default(),
+        storage,
     }
 }
 
@@ -891,45 +900,113 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn read_config(app: &AppHandle) -> Result<Option<JiraConfig>, String> {
-    let path = config_path(app)?;
-    match fs::read_to_string(path) {
-        Ok(raw) => {
-            let mut config: JiraConfig =
-                serde_json::from_str(&raw).map_err(|_| "Jira settings are invalid".to_string())?;
-            config.site = normalize_jira_site(&config.site)?;
-            config.email = config.email.trim().to_string();
-            config.token = config.token.trim().to_string();
-            if config.token.is_empty() || config.email.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(config))
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let Some(raw) = read_secret(app, CONFIG_KEY)? else {
+        return Ok(None);
+    };
+    let mut config: JiraConfig =
+        serde_json::from_str(&raw).map_err(|_| "Jira settings are invalid".to_string())?;
+    config.site = normalize_jira_site(&config.site)?;
+    config.email = config.email.trim().to_string();
+    config.token = config.token.trim().to_string();
+    Ok((!config.token.is_empty() && !config.email.is_empty()).then_some(config))
 }
 
 fn require_config(app: &AppHandle) -> Result<JiraConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect Jira in Settings".to_string())
 }
 
-fn write_config(app: &AppHandle, config: &JiraConfig) -> Result<(), String> {
-    let path = config_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
+fn write_config(app: &AppHandle, config: &JiraConfig) -> Result<StorageMode, String> {
     let value = serde_json::to_string(config).map_err(|error| error.to_string())?;
-    write_secret_file(&path, &value)
+    write_secret(app, CONFIG_KEY, &value)
 }
 
 fn delete_config(app: &AppHandle) -> Result<(), String> {
     let path = config_path(app)?;
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    delete_keyring(CONFIG_KEY)
+}
+
+// ---- Credential storage ----
+
+fn read_keyring(key: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|_| "Could not access the system credential store".to_string())?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => Err("Could not read the Jira token from the system credential store".to_string()),
+    }
+}
+
+fn write_keyring(key: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYRING_SERVICE, key)
+        .and_then(|entry| entry.set_password(value))
+        .map_err(|_| "Could not store the Jira token in the system credential store".to_string())
+}
+
+fn delete_keyring(key: &str) -> Result<(), String> {
+    // An unreachable keychain holds nothing this app could still use.
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, key) else {
+        return Ok(());
+    };
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Could not remove the Jira token from the system credential store".into()),
+    }
+}
+
+fn read_secret_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn read_secret(app: &AppHandle, key: &str) -> Result<Option<String>, String> {
+    let path = config_path(app)?;
+    let legacy = read_secret_file(&path)?;
+    let legacy_present = legacy.is_some();
+    secret_store::apply_secret_plan(
+        secret_store::plan_secret(read_keyring(key), legacy),
+        legacy_present,
+        |value| write_keyring(key, value),
+        || fs::remove_file(&path).map_err(|error| error.to_string()),
+        |error| {
+            eprintln!("monocode: Jira token: {error}");
+        },
+    )
+}
+
+fn secret_storage(app: &AppHandle, key: &str) -> Result<Option<StorageMode>, String> {
+    let file_present = read_secret_file(&config_path(app)?)?.is_some();
+    Ok(secret_store::storage_from(&read_keyring(key), file_present))
+}
+
+fn write_secret(app: &AppHandle, key: &str, value: &str) -> Result<StorageMode, String> {
+    let path = config_path(app)?;
+    if write_keyring(key, value).is_ok() {
+        // Same defect class as round-3 Issue 1 on the migration path: a failed
+        // unlink must not be silent. The next read retries removal via the
+        // Keychain arm, and `storage_from` reports PlaintextFile until it goes.
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "monocode: Jira token: the keychain was updated but the old plaintext file could not be removed: {error}"
+            );
+        }
+        return Ok(StorageMode::Keychain);
+    }
+    // No Secret Service (headless Linux) or a locked keyring: keep a 0600 file.
+    eprintln!("monocode: Jira token stored in a plaintext file; the OS keychain was unavailable");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_secret_file(&path, value)?;
+    Ok(StorageMode::PlaintextFile)
 }
 
 fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {

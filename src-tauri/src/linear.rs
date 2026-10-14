@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
+use crate::secret_store::{self, StorageMode};
+
 const LINEAR_API: &str = "https://api.linear.app/graphql";
+const KEYRING_SERVICE: &str = "MonoCode";
+const TOKEN_KEY: &str = "linear-token";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_LIMIT: u32 = 40;
 
@@ -15,6 +19,7 @@ const DEFAULT_LIMIT: u32 = 40;
 #[serde(rename_all = "camelCase")]
 pub struct LinearStatus {
     pub connected: bool,
+    pub storage: Option<StorageMode>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -103,6 +108,7 @@ pub struct LinearIssueThread {
 pub fn linear_status(app: AppHandle) -> Result<LinearStatus, String> {
     Ok(LinearStatus {
         connected: read_token(&app)?.is_some(),
+        storage: secret_storage(&app, TOKEN_KEY)?,
     })
 }
 
@@ -112,11 +118,17 @@ pub async fn linear_set_token(app: AppHandle, token: String) -> Result<LinearSta
         let trimmed = token.trim().to_string();
         if trimmed.is_empty() {
             delete_token(&app)?;
-            return Ok(LinearStatus { connected: false });
+            return Ok(LinearStatus {
+                connected: false,
+                storage: None,
+            });
         }
         graphql_with_token(&trimmed, VIEWER_QUERY, json!({}))?;
-        write_token(&app, &trimmed)?;
-        Ok(LinearStatus { connected: true })
+        let storage = write_token(&app, &trimmed)?;
+        Ok(LinearStatus {
+            connected: true,
+            storage: Some(storage),
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -674,43 +686,114 @@ fn token_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn read_token(app: &AppHandle) -> Result<Option<String>, String> {
-    let path = token_path(app)?;
-    match fs::read_to_string(&path) {
-        Ok(raw) => {
-            let token = raw.trim().to_string();
-            if token.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(token))
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let Some(raw) = read_secret(app, TOKEN_KEY)? else {
+        return Ok(None);
+    };
+    let token = raw.trim().to_string();
+    Ok(!token.is_empty().then_some(token))
 }
 
 fn require_token(app: &AppHandle) -> Result<String, String> {
     read_token(app)?.ok_or_else(|| "Connect Linear in Settings".to_string())
 }
 
-fn write_token(app: &AppHandle, token: &str) -> Result<(), String> {
-    let path = token_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    write_secret_file(&path, token)
+fn write_token(app: &AppHandle, token: &str) -> Result<StorageMode, String> {
+    write_secret(app, TOKEN_KEY, token)
 }
 
 fn delete_token(app: &AppHandle) -> Result<(), String> {
     let path = token_path(app)?;
     match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    delete_keyring(TOKEN_KEY)
+}
+
+// ---- Credential storage ----
+
+fn read_keyring(key: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|_| "Could not access the system credential store".to_string())?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => {
+            Err("Could not read the Linear token from the system credential store".to_string())
+        }
+    }
+}
+
+fn write_keyring(key: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYRING_SERVICE, key)
+        .and_then(|entry| entry.set_password(value))
+        .map_err(|_| "Could not store the Linear token in the system credential store".to_string())
+}
+
+fn delete_keyring(key: &str) -> Result<(), String> {
+    // An unreachable keychain holds nothing this app could still use.
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, key) else {
+        return Ok(());
+    };
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Could not remove the Linear token from the system credential store".into()),
+    }
+}
+
+fn read_secret_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn write_secret_file(path: &std::path::Path, token: &str) -> Result<(), String> {
+fn read_secret(app: &AppHandle, key: &str) -> Result<Option<String>, String> {
+    let path = token_path(app)?;
+    let legacy = read_secret_file(&path)?;
+    let legacy_present = legacy.is_some();
+    secret_store::apply_secret_plan(
+        secret_store::plan_secret(read_keyring(key), legacy),
+        legacy_present,
+        |value| write_keyring(key, value),
+        || fs::remove_file(&path).map_err(|error| error.to_string()),
+        |error| {
+            eprintln!("monocode: Linear token: {error}");
+        },
+    )
+}
+
+fn secret_storage(app: &AppHandle, key: &str) -> Result<Option<StorageMode>, String> {
+    let file_present = read_secret_file(&token_path(app)?)?.is_some();
+    Ok(secret_store::storage_from(&read_keyring(key), file_present))
+}
+
+fn write_secret(app: &AppHandle, key: &str, value: &str) -> Result<StorageMode, String> {
+    let path = token_path(app)?;
+    if write_keyring(key, value).is_ok() {
+        // A failed unlink here is the same defect class as round-3 Issue 1 on
+        // the migration path: it must not be silent. The next read takes the
+        // Keychain arm with the file still present and retries the removal,
+        // and `storage_from` reports PlaintextFile (UI warning) until it goes.
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "monocode: Linear token: the keychain was updated but the old plaintext file could not be removed: {error}"
+            );
+        }
+        return Ok(StorageMode::Keychain);
+    }
+    // No Secret Service (headless Linux) or a locked keyring: keep a 0600 file.
+    eprintln!("monocode: Linear token stored in a plaintext file; the OS keychain was unavailable");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_secret_file(&path, value)?;
+    Ok(StorageMode::PlaintextFile)
+}
+
+fn write_secret_file(path: &Path, token: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::io::Write;

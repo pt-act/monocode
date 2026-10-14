@@ -7,8 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+use crate::secret_store::{self, StorageMode};
+
 const DEFAULT_GITLAB_URL: &str = "https://gitlab.com";
 const DEFAULT_LIMIT: u32 = 40;
+const KEYRING_SERVICE: &str = "MonoCode";
+const CONFIG_KEY: &str = "gitlab-config";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const USER_AGENT: &str = "MonoCode";
@@ -18,6 +22,7 @@ const USER_AGENT: &str = "MonoCode";
 pub struct GitlabStatus {
     pub connected: bool,
     pub url: String,
+    pub storage: Option<StorageMode>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -121,6 +126,7 @@ pub fn gitlab_status(app: AppHandle) -> Result<GitlabStatus, String> {
         url: config
             .map(|config| config.url)
             .unwrap_or_else(|| DEFAULT_GITLAB_URL.into()),
+        storage: secret_storage(&app, CONFIG_KEY)?,
     })
 }
 
@@ -138,6 +144,7 @@ pub async fn gitlab_set_config(
             return Ok(GitlabStatus {
                 connected: false,
                 url,
+                storage: None,
             });
         }
         let config = GitlabConfig { url, token };
@@ -145,10 +152,11 @@ pub async fn gitlab_set_config(
         if response.value.get("id").and_then(Value::as_i64).is_none() {
             return Err("GitLab did not return the current user".into());
         }
-        write_config(&app, &config)?;
+        let storage = write_config(&app, &config)?;
         Ok(GitlabStatus {
             connected: true,
             url: config.url,
+            storage: Some(storage),
         })
     })
     .await
@@ -1063,44 +1071,114 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn read_config(app: &AppHandle) -> Result<Option<GitlabConfig>, String> {
-    let path = config_path(app)?;
-    match fs::read_to_string(path) {
-        Ok(raw) => {
-            let mut config: GitlabConfig = serde_json::from_str(&raw)
-                .map_err(|_| "GitLab settings are invalid".to_string())?;
-            config.url = normalize_gitlab_url(&config.url)?;
-            config.token = config.token.trim().to_string();
-            if config.token.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(config))
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let Some(raw) = read_secret(app, CONFIG_KEY)? else {
+        return Ok(None);
+    };
+    let mut config: GitlabConfig =
+        serde_json::from_str(&raw).map_err(|_| "GitLab settings are invalid".to_string())?;
+    config.url = normalize_gitlab_url(&config.url)?;
+    config.token = config.token.trim().to_string();
+    Ok(!config.token.is_empty().then_some(config))
 }
 
 fn require_config(app: &AppHandle) -> Result<GitlabConfig, String> {
     read_config(app)?.ok_or_else(|| "Connect GitLab in Settings".to_string())
 }
 
-fn write_config(app: &AppHandle, config: &GitlabConfig) -> Result<(), String> {
-    let path = config_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
+fn write_config(app: &AppHandle, config: &GitlabConfig) -> Result<StorageMode, String> {
     let value = serde_json::to_string(config).map_err(|error| error.to_string())?;
-    write_secret_file(&path, &value)
+    write_secret(app, CONFIG_KEY, &value)
 }
 
 fn delete_config(app: &AppHandle) -> Result<(), String> {
     let path = config_path(app)?;
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    delete_keyring(CONFIG_KEY)
+}
+
+// ---- Credential storage ----
+
+fn read_keyring(key: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+        .map_err(|_| "Could not access the system credential store".to_string())?;
+    match entry.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(_) => {
+            Err("Could not read the GitLab token from the system credential store".to_string())
+        }
+    }
+}
+
+fn write_keyring(key: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYRING_SERVICE, key)
+        .and_then(|entry| entry.set_password(value))
+        .map_err(|_| "Could not store the GitLab token in the system credential store".to_string())
+}
+
+fn delete_keyring(key: &str) -> Result<(), String> {
+    // An unreachable keychain holds nothing this app could still use.
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, key) else {
+        return Ok(());
+    };
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("Could not remove the GitLab token from the system credential store".into()),
+    }
+}
+
+fn read_secret_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn read_secret(app: &AppHandle, key: &str) -> Result<Option<String>, String> {
+    let path = config_path(app)?;
+    let legacy = read_secret_file(&path)?;
+    let legacy_present = legacy.is_some();
+    secret_store::apply_secret_plan(
+        secret_store::plan_secret(read_keyring(key), legacy),
+        legacy_present,
+        |value| write_keyring(key, value),
+        || fs::remove_file(&path).map_err(|error| error.to_string()),
+        |error| {
+            eprintln!("monocode: GitLab token: {error}");
+        },
+    )
+}
+
+fn secret_storage(app: &AppHandle, key: &str) -> Result<Option<StorageMode>, String> {
+    let file_present = read_secret_file(&config_path(app)?)?.is_some();
+    Ok(secret_store::storage_from(&read_keyring(key), file_present))
+}
+
+fn write_secret(app: &AppHandle, key: &str, value: &str) -> Result<StorageMode, String> {
+    let path = config_path(app)?;
+    if write_keyring(key, value).is_ok() {
+        // Same defect class as round-3 Issue 1 on the migration path: a failed
+        // unlink must not be silent. The next read retries removal via the
+        // Keychain arm, and `storage_from` reports PlaintextFile until it goes.
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!(
+                "monocode: GitLab token: the keychain was updated but the old plaintext file could not be removed: {error}"
+            );
+        }
+        return Ok(StorageMode::Keychain);
+    }
+    // No Secret Service (headless Linux) or a locked keyring: keep a 0600 file.
+    eprintln!("monocode: GitLab token stored in a plaintext file; the OS keychain was unavailable");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_secret_file(&path, value)?;
+    Ok(StorageMode::PlaintextFile)
 }
 
 fn write_secret_file(path: &Path, value: &str) -> Result<(), String> {

@@ -121,3 +121,31 @@ it("shows authentication errors without claiming a successful connection", async
   expect(container.querySelector("form")).not.toBeNull();
   expect(container.textContent).not.toContain("Projects");
 });
+
+function mockConnectedStatus(storage: "keychain" | "plaintextFile") {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "jira_status")
+      return {
+        connected: true,
+        site: "acme.atlassian.net",
+        email: "ada@example.com",
+        storage,
+      };
+    if (command === "jira_list_projects") return [];
+    throw new Error(`Unexpected command: ${command}`);
+  });
+}
+
+it("warns that the token is stored in a plaintext file", async () => {
+  mockConnectedStatus("plaintextFile");
+  await act(async () => root.render(createElement(JiraSettings)));
+  expect(container.querySelector('[role="status"]')?.textContent).toContain(
+    "plaintext file",
+  );
+});
+
+it("stays quiet when the token is in the system keychain", async () => {
+  mockConnectedStatus("keychain");
+  await act(async () => root.render(createElement(JiraSettings)));
+  expect(container.querySelector('[role="status"]')).toBeNull();
+});

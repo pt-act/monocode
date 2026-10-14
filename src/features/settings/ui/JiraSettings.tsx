@@ -15,6 +15,7 @@ import {
   type JiraProject,
   type JiraStatus,
 } from "../../inbox/model/jira";
+import { usesPlaintextFallback } from "../../inbox/model/secretStorage";
 
 export function JiraSettings() {
   const [status, setStatus] = useState<JiraStatus | null>(null);
@@ -190,6 +191,13 @@ export function JiraSettings() {
       {error ? (
         <p role="alert" className="mt-3 text-[12px] text-red-400/90">
           {error}
+        </p>
+      ) : null}
+      {status?.connected && usesPlaintextFallback(status.storage) ? (
+        <p role="status" className="mt-3 text-[12px] text-amber-400/90">
+          Your system keychain is unavailable, so this token is stored
+          unencrypted in a plaintext file in the app data folder. Unlock or
+          install a system keychain, then reconnect, to store it securely.
         </p>
       ) : null}
       {status?.connected ? (
